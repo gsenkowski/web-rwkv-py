@@ -1,9 +1,11 @@
 use std::{
     fs::File,
-    io::{BufReader, Read},
+    io::{BufReader, BufWriter, Read, Write},
     path::PathBuf,
     sync::Arc,
 };
+
+use std::time::Instant;
 
 use anyhow::{bail, Result};
 use derivative::Derivative;
@@ -27,6 +29,8 @@ use web_rwkv::{
     },
     wgpu,
 };
+use web_rwkv::tensor::Gpu;
+
 
 pub mod info;
 
@@ -203,6 +207,96 @@ impl Model {
         State::Cpu { state }
     }
 
+    #[pyo3(signature = (filename, device=StateDevice::Cpu))]
+    pub fn save_state_to_file(&self, filename: PathBuf, device: StateDevice) -> PyResult<()> {
+        // Retrieve the state on the requested device and convert to CPU for saving.
+        let state = self.back_state(device)?;
+        let state_cpu = state.to(StateDevice::Cpu);
+        if let State::Cpu { state: StateCpu(tensor, _context) } = state_cpu {
+            // Collect dimensions using the public iterator.
+            let dims_vec: Vec<usize> = tensor.shape().iter().collect();
+            if dims_vec.len() != 4 {
+                return Err(err("Expected tensor shape of length 4"));
+            }
+            let dims: [usize; 4] = dims_vec[..]
+                .try_into()
+                .map_err(|_| err("Failed to convert shape slice to array"))?;
+            let data = tensor.to_vec();
+
+            // Open file and wrap with BufWriter.
+            let file = File::create(filename).map_err(err)?;
+            let mut writer = BufWriter::new(file);
+
+            // Write the number of dimensions.
+            let num_dims = dims.len() as u64;
+            writer.write_all(&num_dims.to_le_bytes()).map_err(err)?;
+            // Write each dimension.
+            for &dim in &dims {
+                writer.write_all(&(dim as u64).to_le_bytes()).map_err(err)?;
+            }
+            // Write the number of data elements.
+            writer.write_all(&(data.len() as u64).to_le_bytes()).map_err(err)?;
+
+            // Safely convert the f32 data to a u8 vector without unsafe.
+            let data_bytes: Vec<u8> = data.iter()
+                .flat_map(|val| val.to_le_bytes())
+                .collect();
+            writer.write_all(&data_bytes).map_err(err)?;
+            writer.flush().map_err(err)?;
+            Ok(())
+        } else {
+            Err(err("Unexpected state variant"))
+        }
+    }
+
+    #[pyo3(signature = (filename, device=StateDevice::Cpu))]
+    pub fn load_state_from_file(&self, filename: PathBuf, device: StateDevice) -> PyResult<()> {
+        let file = File::open(filename).map_err(err)?;
+        let mut reader = BufReader::new(file);
+
+        // Read the number of dimensions.
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8).map_err(err)?;
+        let num_dims = u64::from_le_bytes(buf8) as usize;
+
+        // Read each dimension.
+        let mut dims_vec = Vec::with_capacity(num_dims);
+        for _ in 0..num_dims {
+            reader.read_exact(&mut buf8).map_err(err)?;
+            dims_vec.push(u64::from_le_bytes(buf8) as usize);
+        }
+        if dims_vec.len() != 4 {
+            return Err(err("Expected tensor shape of length 4"));
+        }
+        let dims: [usize; 4] = [dims_vec[0], dims_vec[1], dims_vec[2], dims_vec[3]];
+
+        // Read the number of data elements.
+        reader.read_exact(&mut buf8).map_err(err)?;
+        let data_len = u64::from_le_bytes(buf8) as usize;
+
+        // Allocate a buffer for the tensor data.
+        let num_bytes = data_len * std::mem::size_of::<f32>();
+        let mut data_bytes = vec![0u8; num_bytes];
+        reader.read_exact(&mut data_bytes).map_err(err)?;
+
+        // Convert the byte buffer to a Vec<f32> safely.
+        let data: Vec<f32> = data_bytes
+            .chunks_exact(4)
+            .map(|chunk| {
+                let arr: [u8; 4] = chunk
+                    .try_into()
+                    .expect("chunks_exact always returns a slice of length 4");
+                f32::from_le_bytes(arr)
+            })
+            .collect();
+
+        // Reconstruct the tensor from the shape and data.
+        let tensor = TensorCpu::from_data(dims, data).map_err(err)?;
+        let state_cpu = StateCpu(tensor, self.context.clone());
+        let state = State::Cpu { state: state_cpu }.to(device);
+        self.load_state(&state)
+    }
+    
     pub fn clear_state(&self) {
         let _ = self.load_state(&self.init_state());
     }
