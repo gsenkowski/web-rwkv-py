@@ -23,6 +23,6 @@ web-rwkv-derive = "0.2.0"
 
 [dependencies.web-rwkv]
 default-features = false
-features = ["native"]
+features = ["native", "tokio"]
 # path = "../web-rwkv"
-version = "0.10.8"
+version = "0.10.13"

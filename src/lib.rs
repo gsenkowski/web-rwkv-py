@@ -16,7 +16,8 @@ use safetensors::SafeTensors;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
-        infer::{InferInput, InferInputBatch, InferOption, InferOutput},
+        infer::{Token},
+        infer::rnn::{Rnn, RnnInput, RnnInputBatch, RnnOption},
         loader::Loader,
         model::{
             ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant,
@@ -29,7 +30,6 @@ use web_rwkv::{
     },
     wgpu,
 };
-use web_rwkv::tensor::Gpu;
 
 
 pub mod info;
@@ -46,7 +46,7 @@ pub struct Model {
     tokio: Arc<tokio::runtime::Runtime>,
     info: ModelInfo,
     context: Context,
-    runtime: TokioRuntime<InferInput, InferOutput>,
+    runtime: TokioRuntime<Rnn>,
     #[derivative(Debug = "ignore")]
     state: Arc<dyn ModelState + Send + Sync>,
 }
@@ -130,7 +130,7 @@ async fn load_runtime(
 ) -> Result<(
     Context,
     ModelInfo,
-    TokioRuntime<InferInput, InferOutput>,
+    TokioRuntime<Rnn>,
     Arc<dyn ModelState + Send + Sync>,
 )> {
     let file = File::open(path)?;
@@ -328,7 +328,7 @@ impl Model {
     #[pyo3(signature = (tokens, token_chunk_size=128))]
     pub fn run(&self, tokens: Vec<u16>, token_chunk_size: usize) -> PyResult<Vec<f32>> {
         let model = self.clone();
-        let option = InferOption::Last;
+        let option = RnnOption::Last;
         let output = self
             .tokio
             .block_on(model.run_internal(tokens, option, token_chunk_size))
@@ -340,7 +340,7 @@ impl Model {
     #[pyo3(signature = (tokens, token_chunk_size=128))]
     pub fn run_full(&self, tokens: Vec<u16>, token_chunk_size: usize) -> PyResult<Vec<f32>> {
         let model = self.clone();
-        let option = InferOption::Full;
+        let option = RnnOption::Full;
         let output = self
             .tokio
             .block_on(model.run_internal(tokens, option, token_chunk_size))
@@ -354,15 +354,16 @@ impl Model {
     async fn run_internal(
         &self,
         tokens: Vec<u16>,
-        option: InferOption,
+        option: RnnOption,
         token_chunk_size: usize,
     ) -> Result<TensorCpu<f32>> {
         if tokens.is_empty() {
             bail!("input tokens cannot be empty")
         }
-
-        let mut inference = Some(InferInput::new(
-            vec![InferInputBatch { tokens, option }],
+        
+        let tokens_token: Vec<Token> = tokens.into_iter().map(Token::from).collect();
+        let mut inference = Some(RnnInput::new(
+            vec![RnnInputBatch::new(tokens_token, option)],
             token_chunk_size,
         ));
         let mut data = vec![];
