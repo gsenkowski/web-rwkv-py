@@ -3,6 +3,7 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     path::PathBuf,
     sync::Arc,
+    collections::HashMap,
 };
 
 use std::time::Instant;
@@ -12,7 +13,7 @@ use derivative::Derivative;
 use half::f16;
 use memmap2::Mmap;
 use pyo3::{exceptions::PyValueError, prelude::*};
-use safetensors::SafeTensors;
+use safetensors::tensor::SafeTensors;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
@@ -103,7 +104,7 @@ pub struct StateCpu(TensorCpu<f32>, Context);
 #[derive(Debug, Clone)]
 pub struct StateGpu(TensorGpu<f32, ReadWrite>);
 
-#[pyclass]
+#[pyclass(eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StateDevice {
     Cpu,
@@ -140,13 +141,15 @@ async fn load_runtime(
     let info = Loader::info(&model)?;
 
     let context = create_context(&info).await?;
-    let quant = (0..quant)
+    let quant: HashMap<usize, Quant> = (0..quant)
         .map(|layer| (layer, Quant::Int8))
         .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
         .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
         .collect();
 
-    let builder = ModelBuilder::new(&context, model).quant(quant);
+    let mut builder = ModelBuilder::new(&context, model);
+
+    builder.quant = quant;
 
     match info.version {
         ModelVersion::V4 => {
@@ -326,7 +329,7 @@ impl Model {
     }
 
     #[pyo3(signature = (tokens, token_chunk_size=128))]
-    pub fn run(&self, tokens: Vec<u16>, token_chunk_size: usize) -> PyResult<Vec<f32>> {
+    pub fn run(&self, tokens: Vec<u32>, token_chunk_size: usize) -> PyResult<Vec<f32>> {
         let model = self.clone();
         let option = RnnOption::Last;
         let output = self
@@ -338,7 +341,7 @@ impl Model {
     }
 
     #[pyo3(signature = (tokens, token_chunk_size=128))]
-    pub fn run_full(&self, tokens: Vec<u16>, token_chunk_size: usize) -> PyResult<Vec<f32>> {
+    pub fn run_full(&self, tokens: Vec<u32>, token_chunk_size: usize) -> PyResult<Vec<f32>> {
         let model = self.clone();
         let option = RnnOption::Full;
         let output = self
@@ -353,7 +356,7 @@ impl Model {
 impl Model {
     async fn run_internal(
         &self,
-        tokens: Vec<u16>,
+        tokens: Vec<u32>,
         option: RnnOption,
         token_chunk_size: usize,
     ) -> Result<TensorCpu<f32>> {
@@ -411,11 +414,11 @@ impl Tokenizer {
         Ok(Self(load_tokenizer(path).map_err(err)?))
     }
 
-    pub fn encode(&self, text: &str) -> PyResult<Vec<u16>> {
+    pub fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
         self.0.encode(text.as_bytes()).map_err(err)
     }
 
-    pub fn decode(&self, tokens: Vec<u16>) -> PyResult<Vec<u8>> {
+    pub fn decode(&self, tokens: Vec<u32>) -> PyResult<Vec<u8>> {
         self.0.decode(&tokens).map_err(err)
     }
 }
